@@ -177,6 +177,35 @@ export const CLAUDE_REQUEST_HEADERS = {
   'anthropic-beta': 'oauth-2025-04-20',
 };
 
+export const CLAUDE_CODE_QUOTA_PROBE_URL = 'https://api.anthropic.com/v1/messages?beta=true';
+
+// Matches the Claude Code-style header envelope that Anthropic accepts for setup-token requests.
+export const CLAUDE_CODE_QUOTA_PROBE_HEADERS = {
+  Authorization: 'Bearer $TOKEN$',
+  Accept: 'application/json',
+  'Content-Type': 'application/json',
+  'Anthropic-Beta':
+    'claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,context-management-2025-06-27,prompt-caching-scope-2026-01-05',
+  'Anthropic-Version': '2023-06-01',
+  'Anthropic-Dangerous-Direct-Browser-Access': 'true',
+  'X-App': 'cli',
+  'X-Stainless-Retry-Count': '0',
+  'X-Stainless-Runtime': 'node',
+  'X-Stainless-Lang': 'js',
+  'X-Stainless-Runtime-Version': 'v24.3.0',
+  'X-Stainless-Package-Version': '0.74.0',
+  'X-Stainless-Arch': 'x64',
+  'X-Stainless-Os': 'Linux',
+  'X-Stainless-Timeout': '600',
+  'User-Agent': 'claude-cli/2.1.63 (external, cli)',
+};
+
+export const CLAUDE_CODE_QUOTA_PROBE_BODY = JSON.stringify({
+  model: 'claude-haiku-4-5-20251001',
+  max_tokens: 1,
+  messages: [{ role: 'user', content: 'Reply with exactly: ok' }],
+});
+
 export const CLAUDE_USAGE_WINDOW_KEYS = [
   { key: 'five_hour', id: 'five-hour', labelKey: 'claude_quota.five_hour' },
   { key: 'seven_day', id: 'seven-day', labelKey: 'claude_quota.seven_day' },
@@ -189,6 +218,23 @@ export const CLAUDE_USAGE_WINDOW_KEYS = [
   { key: 'seven_day_sonnet', id: 'seven-day-sonnet', labelKey: 'claude_quota.seven_day_sonnet' },
   { key: 'seven_day_cowork', id: 'seven-day-cowork', labelKey: 'claude_quota.seven_day_cowork' },
   { key: 'iguana_necktie', id: 'iguana-necktie', labelKey: 'claude_quota.iguana_necktie' },
+] as const;
+
+export const CLAUDE_RATE_LIMIT_WINDOW_HEADERS = [
+  {
+    id: 'five-hour',
+    labelKey: 'claude_quota.five_hour',
+    statusHeader: 'anthropic-ratelimit-unified-5h-status',
+    resetHeader: 'anthropic-ratelimit-unified-5h-reset',
+    utilizationHeader: 'anthropic-ratelimit-unified-5h-utilization',
+  },
+  {
+    id: 'seven-day',
+    labelKey: 'claude_quota.seven_day',
+    statusHeader: 'anthropic-ratelimit-unified-7d-status',
+    resetHeader: 'anthropic-ratelimit-unified-7d-reset',
+    utilizationHeader: 'anthropic-ratelimit-unified-7d-utilization',
+  },
 ] as const;
 
 // Codex API configuration

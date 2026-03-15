@@ -182,6 +182,7 @@ export interface ClaudeQuotaWindow {
   labelKey?: string;
   usedPercent: number | null;
   resetLabel: string;
+  status?: string | null;
 }
 
 export interface ClaudeQuotaState {
@@ -189,6 +190,9 @@ export interface ClaudeQuotaState {
   windows: ClaudeQuotaWindow[];
   extraUsage?: ClaudeExtraUsage | null;
   planType?: string | null;
+  overallStatus?: string | null;
+  overallResetLabel?: string;
+  representativeClaim?: string | null;
   error?: string;
   errorStatus?: number;
 }

@@ -37,7 +37,11 @@ import { useQuotaStore } from '@/stores';
 import {
   ANTIGRAVITY_QUOTA_URLS,
   ANTIGRAVITY_REQUEST_HEADERS,
+  CLAUDE_CODE_QUOTA_PROBE_BODY,
+  CLAUDE_CODE_QUOTA_PROBE_HEADERS,
+  CLAUDE_CODE_QUOTA_PROBE_URL,
   CLAUDE_PROFILE_URL,
+  CLAUDE_RATE_LIMIT_WINDOW_HEADERS,
   CLAUDE_USAGE_URL,
   CLAUDE_REQUEST_HEADERS,
   CLAUDE_USAGE_WINDOW_KEYS,
@@ -67,6 +71,7 @@ import {
   resolveGeminiCliProjectId,
   formatCodexResetLabel,
   formatQuotaResetTime,
+  formatUnixSeconds,
   formatKimiResetHint,
   buildAntigravityQuotaGroups,
   buildGeminiCliQuotaBuckets,
@@ -942,7 +947,7 @@ const buildClaudeQuotaWindows = (
     const window = payload[key as keyof ClaudeUsagePayload];
     if (!window || typeof window !== 'object' || !('utilization' in window)) continue;
     const typedWindow = window as { utilization: number; resets_at: string };
-    const usedPercent = normalizeNumberValue(typedWindow.utilization);
+    const usedPercent = normalizeClaudeUtilizationPercent(typedWindow.utilization);
     const resetLabel = formatQuotaResetTime(typedWindow.resets_at);
     windows.push({
       id,
@@ -950,6 +955,87 @@ const buildClaudeQuotaWindows = (
       labelKey,
       usedPercent,
       resetLabel,
+    });
+  }
+
+  return windows;
+};
+
+const normalizeApiCallHeaderValue = (
+  headers: Record<string, string[]> | undefined,
+  headerName: string
+): string | null => {
+  if (!headers) return null;
+
+  const target = headerName.trim().toLowerCase();
+  if (!target) return null;
+
+  for (const [key, values] of Object.entries(headers)) {
+    if (key.trim().toLowerCase() !== target) continue;
+    if (!Array.isArray(values)) return null;
+    for (const value of values) {
+      const normalized = normalizeStringValue(value);
+      if (normalized) return normalized;
+    }
+    return null;
+  }
+
+  return null;
+};
+
+const normalizeClaudeRateLimitStatus = (value: unknown): string | null => {
+  const normalized = normalizeStringValue(value);
+  return normalized ? normalized.toLowerCase() : null;
+};
+
+const normalizeClaudeRepresentativeClaim = (value: unknown): string | null => {
+  const normalized = normalizeStringValue(value);
+  if (!normalized) return null;
+
+  const lowered = normalized.toLowerCase();
+  if (lowered === 'five_hour' || lowered === 'five-hour' || lowered === '5h') return 'five_hour';
+  if (lowered === 'seven_day' || lowered === 'seven-day' || lowered === '7d') return 'seven_day';
+  return lowered;
+};
+
+const normalizeClaudeUtilizationPercent = (value: unknown): number | null => {
+  const normalized = normalizeNumberValue(value);
+  if (normalized === null) return null;
+  if (normalized >= 0 && normalized <= 1) {
+    return normalized * 100;
+  }
+  return normalized;
+};
+
+const buildClaudeRateLimitProbeWindows = (
+  headers: Record<string, string[]>,
+  t: TFunction
+): ClaudeQuotaWindow[] => {
+  const windows: ClaudeQuotaWindow[] = [];
+
+  for (const windowMeta of CLAUDE_RATE_LIMIT_WINDOW_HEADERS) {
+    const status = normalizeClaudeRateLimitStatus(
+      normalizeApiCallHeaderValue(headers, windowMeta.statusHeader)
+    );
+    const resetAt = normalizeNumberValue(
+      normalizeApiCallHeaderValue(headers, windowMeta.resetHeader)
+    );
+    const usedPercent = normalizeClaudeUtilizationPercent(
+      normalizeApiCallHeaderValue(headers, windowMeta.utilizationHeader)
+    );
+    const resetLabel = formatUnixSeconds(resetAt);
+
+    if (!status && usedPercent === null && resetLabel === '-') {
+      continue;
+    }
+
+    windows.push({
+      id: windowMeta.id,
+      label: t(windowMeta.labelKey),
+      labelKey: windowMeta.labelKey,
+      usedPercent,
+      resetLabel,
+      status,
     });
   }
 
@@ -1017,6 +1103,9 @@ const fetchClaudeQuota = async (
   windows: ClaudeQuotaWindow[];
   extraUsage?: ClaudeExtraUsage | null;
   planType?: string | null;
+  overallStatus?: string | null;
+  overallResetLabel?: string;
+  representativeClaim?: string | null;
 }> => {
   const rawAuthIndex = file['auth_index'] ?? file.authIndex;
   const authIndex = normalizeAuthIndex(rawAuthIndex);
@@ -1024,47 +1113,103 @@ const fetchClaudeQuota = async (
     throw new Error(t('claude_quota.missing_auth_index'));
   }
 
-  const [usageResult, profileResult] = await Promise.allSettled([
-    apiCallApi.request({
+  const fetchClaudeQuotaViaProbe = async () => {
+    const result = await apiCallApi.request({
+      authIndex,
+      method: 'POST',
+      url: CLAUDE_CODE_QUOTA_PROBE_URL,
+      header: { ...CLAUDE_CODE_QUOTA_PROBE_HEADERS },
+      data: CLAUDE_CODE_QUOTA_PROBE_BODY,
+    });
+
+    if (result.statusCode < 200 || result.statusCode >= 300) {
+      throw createStatusError(getApiCallErrorMessage(result), result.statusCode);
+    }
+
+    const windows = buildClaudeRateLimitProbeWindows(result.header, t);
+    const overallStatus = normalizeClaudeRateLimitStatus(
+      normalizeApiCallHeaderValue(result.header, 'anthropic-ratelimit-unified-status')
+    );
+    const overallResetLabel = formatUnixSeconds(
+      normalizeNumberValue(normalizeApiCallHeaderValue(result.header, 'anthropic-ratelimit-unified-reset'))
+    );
+    const representativeClaim = normalizeClaudeRepresentativeClaim(
+      normalizeApiCallHeaderValue(result.header, 'anthropic-ratelimit-unified-representative-claim')
+    );
+
+    if (
+      windows.length === 0 &&
+      !overallStatus &&
+      !representativeClaim &&
+      overallResetLabel === '-'
+    ) {
+      throw new Error(t('claude_quota.empty_windows'));
+    }
+
+    return {
+      windows,
+      overallStatus,
+      overallResetLabel,
+      representativeClaim,
+    };
+  };
+
+  let oauthError: unknown = null;
+
+  try {
+    const usageResult = await apiCallApi.request({
       authIndex,
       method: 'GET',
       url: CLAUDE_USAGE_URL,
       header: { ...CLAUDE_REQUEST_HEADERS },
-    }),
-    apiCallApi.request({
-      authIndex,
-      method: 'GET',
-      url: CLAUDE_PROFILE_URL,
-      header: { ...CLAUDE_REQUEST_HEADERS },
-    }),
-  ]);
+    });
 
-  if (usageResult.status === 'rejected') {
-    throw usageResult.reason;
+    if (usageResult.statusCode < 200 || usageResult.statusCode >= 300) {
+      throw createStatusError(getApiCallErrorMessage(usageResult), usageResult.statusCode);
+    }
+
+    const payload = parseClaudeUsagePayload(usageResult.body ?? usageResult.bodyText);
+    if (!payload) {
+      throw new Error(t('claude_quota.empty_windows'));
+    }
+
+    const windows = buildClaudeQuotaWindows(payload, t);
+    if (windows.length === 0 && !payload.extra_usage) {
+      throw new Error(t('claude_quota.empty_windows'));
+    }
+
+    let planType: string | null = null;
+    try {
+      const profileResult = await apiCallApi.request({
+        authIndex,
+        method: 'GET',
+        url: CLAUDE_PROFILE_URL,
+        header: { ...CLAUDE_REQUEST_HEADERS },
+      });
+
+      if (profileResult.statusCode >= 200 && profileResult.statusCode < 300) {
+        planType = resolveClaudePlanType(
+          parseClaudeProfilePayload(profileResult.body ?? profileResult.bodyText)
+        );
+      }
+    } catch {
+      // setup-token and limited OAuth variants may reject the profile endpoint; ignore plan in that case.
+    }
+
+    return { windows, extraUsage: payload.extra_usage, planType };
+  } catch (err: unknown) {
+    oauthError = err;
   }
 
-  const result = usageResult.value;
-
-  if (result.statusCode < 200 || result.statusCode >= 300) {
-    throw createStatusError(getApiCallErrorMessage(result), result.statusCode);
+  try {
+    return await fetchClaudeQuotaViaProbe();
+  } catch (probeError: unknown) {
+    const probeStatus = getStatusFromError(probeError);
+    if (probeStatus !== undefined || oauthError === null) {
+      throw probeError;
+    }
+    throw oauthError;
   }
-
-  const payload = parseClaudeUsagePayload(result.body ?? result.bodyText);
-  if (!payload) {
-    throw new Error(t('claude_quota.empty_windows'));
-  }
-
-  const windows = buildClaudeQuotaWindows(payload, t);
-  const planType =
-    profileResult.status === 'fulfilled' &&
-    profileResult.value.statusCode >= 200 &&
-    profileResult.value.statusCode < 300
-      ? resolveClaudePlanType(
-          parseClaudeProfilePayload(profileResult.value.body ?? profileResult.value.bodyText)
-        )
-      : null;
-
-  return { windows, extraUsage: payload.extra_usage, planType };
 };
 
 const renderClaudeItems = (
@@ -1077,7 +1222,41 @@ const renderClaudeItems = (
   const windows = quota.windows ?? [];
   const extraUsage = quota.extraUsage ?? null;
   const planType = quota.planType ?? null;
+  const overallStatus = quota.overallStatus ?? null;
+  const overallResetLabel = quota.overallResetLabel ?? '-';
+  const representativeClaim = quota.representativeClaim ?? null;
   const nodes: ReactNode[] = [];
+
+  const formatUtilizationLabel = (value: number | null): string => {
+    if (value === null) return '--';
+    const clamped = Math.max(0, Math.min(100, value));
+    const rounded = Number.isInteger(clamped)
+      ? clamped.toFixed(0)
+      : clamped >= 10
+        ? clamped.toFixed(0)
+        : clamped.toFixed(1);
+    return t('claude_quota.utilization_value', { value: rounded });
+  };
+
+  const resolveStatusLabel = (status: string | null | undefined): string | null => {
+    const normalized = normalizeClaudeRateLimitStatus(status);
+    if (!normalized) return null;
+    if (normalized === 'allowed') return t('claude_quota.status_allowed');
+    if (normalized === 'rejected') return t('claude_quota.status_rejected');
+    return normalized;
+  };
+
+  const resolveRepresentativeClaimLabel = (claim: string | null | undefined): string | null => {
+    const normalized = normalizeClaudeRepresentativeClaim(claim);
+    if (!normalized) return null;
+    const windowLabel =
+      normalized === 'five_hour'
+        ? t('claude_quota.five_hour')
+        : normalized === 'seven_day'
+          ? t('claude_quota.seven_day')
+          : normalized;
+    return t('claude_quota.representative_claim_label', { window: windowLabel });
+  };
 
   if (planType) {
     nodes.push(
@@ -1102,6 +1281,35 @@ const renderClaudeItems = (
     );
   }
 
+  const overallStatusLabel = resolveStatusLabel(overallStatus);
+  const representativeClaimLabel = resolveRepresentativeClaimLabel(representativeClaim);
+  if (overallStatusLabel || representativeClaimLabel || overallResetLabel !== '-') {
+    nodes.push(
+      h(
+        'div',
+        { key: 'overall', className: styleMap.quotaRow },
+        h(
+          'div',
+          { className: styleMap.quotaRowHeader },
+          h('span', { className: styleMap.quotaModel }, t('claude_quota.overall_status')),
+          h(
+            'div',
+            { className: styleMap.quotaMeta },
+            overallStatusLabel
+              ? h('span', { className: styleMap.quotaPercent }, overallStatusLabel)
+              : null,
+            representativeClaimLabel
+              ? h('span', { className: styleMap.quotaAmount }, representativeClaimLabel)
+              : null,
+            overallResetLabel !== '-'
+              ? h('span', { className: styleMap.quotaReset }, overallResetLabel)
+              : null
+          )
+        )
+      )
+    );
+  }
+
   if (windows.length === 0) {
     nodes.push(
       h('div', { key: 'empty', className: styleMap.quotaMessage }, t('claude_quota.empty_windows'))
@@ -1113,8 +1321,8 @@ const renderClaudeItems = (
     ...windows.map((window) => {
       const used = window.usedPercent;
       const clampedUsed = used === null ? null : Math.max(0, Math.min(100, used));
-      const remaining = clampedUsed === null ? null : Math.max(0, Math.min(100, 100 - clampedUsed));
-      const percentLabel = remaining === null ? '--' : `${Math.round(remaining)}%`;
+      const percentLabel = formatUtilizationLabel(clampedUsed);
+      const statusLabel = resolveStatusLabel(window.status);
       const windowLabel = window.labelKey ? t(window.labelKey) : window.label;
 
       return h(
@@ -1128,14 +1336,11 @@ const renderClaudeItems = (
             'div',
             { className: styleMap.quotaMeta },
             h('span', { className: styleMap.quotaPercent }, percentLabel),
+            statusLabel ? h('span', { className: styleMap.quotaAmount }, statusLabel) : null,
             h('span', { className: styleMap.quotaReset }, window.resetLabel)
           )
         ),
-        h(QuotaProgressBar, {
-          percent: remaining,
-          highThreshold: QUOTA_PROGRESS_HIGH_THRESHOLD,
-          mediumThreshold: QUOTA_PROGRESS_MEDIUM_THRESHOLD,
-        })
+        h(QuotaProgressBar, { percent: clampedUsed, highThreshold: 80, mediumThreshold: 50 })
       );
     })
   );
@@ -1145,7 +1350,14 @@ const renderClaudeItems = (
 
 export const CLAUDE_CONFIG: QuotaConfig<
   ClaudeQuotaState,
-  { windows: ClaudeQuotaWindow[]; extraUsage?: ClaudeExtraUsage | null; planType?: string | null }
+  {
+    windows: ClaudeQuotaWindow[];
+    extraUsage?: ClaudeExtraUsage | null;
+    planType?: string | null;
+    overallStatus?: string | null;
+    overallResetLabel?: string;
+    representativeClaim?: string | null;
+  }
 > = {
   type: 'claude',
   i18nPrefix: 'claude_quota',
@@ -1160,6 +1372,9 @@ export const CLAUDE_CONFIG: QuotaConfig<
     windows: data.windows,
     extraUsage: data.extraUsage,
     planType: data.planType,
+    overallStatus: data.overallStatus,
+    overallResetLabel: data.overallResetLabel,
+    representativeClaim: data.representativeClaim,
   }),
   buildErrorState: (message, status) => ({
     status: 'error',
