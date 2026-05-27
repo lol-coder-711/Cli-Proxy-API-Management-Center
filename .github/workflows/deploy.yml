@@ -96,11 +96,9 @@ jobs:
           git config user.email "mgmtcenter-deploy@joe-ubuntu.local"
           git config user.name "mgmtcenter-deploy"
           git add management-panel/management.html
-          git commit -m "frontend: deploy management.html from mgmt-center ${{ github.sha }}
-
-Auto-deployed by mgmtcenter-ephemeral-runner from
-https://github.com/${{ github.repository }}/commit/${{ github.sha }}
-"
+          git commit \
+            -m "frontend: deploy management.html from mgmt-center ${{ github.sha }}" \
+            -m "Auto-deployed by mgmtcenter-ephemeral-runner from https://github.com/${{ github.repository }}/commit/${{ github.sha }}"
           git push origin HEAD:main
 
       - name: Live smoke (UI bytes served via bind-mount)
