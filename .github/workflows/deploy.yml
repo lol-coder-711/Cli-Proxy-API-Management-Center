@@ -47,6 +47,11 @@ jobs:
           git fetch origin "${{ github.ref }}"
           git reset --hard "${{ github.sha }}"
 
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: '1.3.14'
+
       - name: Bun install
         run: |
           cd "$REPO_ROOT"
