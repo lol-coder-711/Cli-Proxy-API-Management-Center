@@ -1,0 +1,115 @@
+name: Deploy
+
+# Frontend CD: on a successful push to the deploy branch, run gating, build
+# dist/index.html, and ship it to the cliproxyapi backend's bind-mount path so
+# the cliproxy container serves the new UI immediately. Also commits the new
+# bundle into the backend repo so its git tree stays clean (otherwise the
+# backend's ci-preflight will reject its working tree as dirty next deploy).
+#
+# Runs on the mgmtcenter self-hosted runner (joe-ubuntu) which has BOTH this
+# repo and the cliproxyapi backend bind-mounted at the same host paths the
+# workflow operates on.
+
+on:
+  push:
+    branches:
+      - v1.12.0-with-usage-page
+  workflow_dispatch: {}
+
+concurrency:
+  group: mgmtcenter-deploy
+  cancel-in-progress: false
+
+env:
+  REPO_ROOT: /home/joe/Cli-Proxy-API-Management-Center
+  BACKEND_ROOT: /home/joe/services/cliproxyapi
+  BIND_MOUNT_TARGET: /home/joe/services/cliproxyapi/management-panel/management.html
+
+jobs:
+  deploy:
+    # Guard against PR-triggered self-hosted runs from forks; ours always
+    # originate from lol-coder-711's own pushes/dispatches.
+    if: github.actor == 'lol-coder-711' || github.event_name == 'workflow_dispatch'
+    runs-on: [self-hosted, mgmtcenter-ephemeral, deploy]
+    timeout-minutes: 20
+
+    steps:
+      - name: Reset host worktree to this commit
+        run: |
+          set -euo pipefail
+          cd "$REPO_ROOT"
+          # Refuse if uncommitted changes/untracked files would be clobbered.
+          if ! git diff --quiet || ! git diff --cached --quiet || [ -n "$(git status --porcelain)" ]; then
+            echo "FATAL: working tree not clean in $REPO_ROOT" >&2
+            git status --short >&2
+            exit 1
+          fi
+          git fetch origin "${{ github.ref }}"
+          git reset --hard "${{ github.sha }}"
+
+      - name: Bun install
+        run: |
+          cd "$REPO_ROOT"
+          bun install --frozen-lockfile
+
+      - name: Gating (type-check + lint + test)
+        run: |
+          cd "$REPO_ROOT"
+          bun run type-check
+          bun run lint
+          bun run test
+
+      - name: Build (tsc && vite build)
+        run: |
+          cd "$REPO_ROOT"
+          bun run build
+          ls -lh dist/index.html
+
+      - name: Verify backend worktree is clean before mutating it
+        run: |
+          set -euo pipefail
+          cd "$BACKEND_ROOT"
+          if ! git diff --quiet || ! git diff --cached --quiet; then
+            echo "FATAL: backend worktree dirty; refusing to commit on top" >&2
+            git status --short >&2
+            exit 1
+          fi
+          # Pull latest so our commit is fast-forward.
+          git fetch origin main
+          # Resolve any branch drift: ensure we are on a branch tracking origin/main.
+          current_branch="$(git rev-parse --abbrev-ref HEAD)"
+          if [ "$current_branch" = "HEAD" ] || ! git rev-parse --verify "origin/main" >/dev/null 2>&1; then
+            echo "FATAL: backend not on a normal branch with origin/main" >&2
+            exit 1
+          fi
+          git reset --hard origin/main
+
+      - name: Deploy artifact to backend bind-mount + commit
+        run: |
+          set -euo pipefail
+          cd "$BACKEND_ROOT"
+          cp "$REPO_ROOT/dist/index.html" "$BIND_MOUNT_TARGET"
+          if git diff --quiet management-panel/management.html; then
+            echo "no UI bytes changed; skipping commit"
+            exit 0
+          fi
+          git config user.email "mgmtcenter-deploy@joe-ubuntu.local"
+          git config user.name "mgmtcenter-deploy"
+          git add management-panel/management.html
+          git commit -m "frontend: deploy management.html from mgmt-center ${{ github.sha }}
+
+Auto-deployed by mgmtcenter-ephemeral-runner from
+https://github.com/${{ github.repository }}/commit/${{ github.sha }}
+"
+          git push origin HEAD:main
+
+      - name: Live smoke (UI bytes served via bind-mount)
+        run: |
+          set -euo pipefail
+          served="$(curl -fsS http://127.0.0.1:8317/management.html | wc -c)"
+          on_disk="$(wc -c < "$BIND_MOUNT_TARGET")"
+          echo "served=$served on_disk=$on_disk"
+          if [ "$served" -lt 100000 ]; then
+            echo "FATAL: served bytes implausibly small" >&2
+            exit 1
+          fi
