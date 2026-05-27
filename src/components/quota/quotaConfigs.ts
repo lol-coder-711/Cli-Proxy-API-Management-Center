@@ -1007,7 +1007,32 @@ const normalizeClaudeUtilizationPercent = (value: unknown): number | null => {
   return normalized;
 };
 
-const buildClaudeRateLimitProbeWindows = (
+// claudeRemainingPercent inverts the Anthropic "utilization" (used %) into the
+// remaining %, clamped to [0,100], so the Claude card matches the Codex/Gemini
+// cards which all display remaining headroom. Exported for unit testing.
+export const claudeRemainingPercent = (usedPercent: number | null): number | null => {
+  if (usedPercent === null) return null;
+  const clampedUsed = Math.max(0, Math.min(100, usedPercent));
+  return Math.max(0, Math.min(100, 100 - clampedUsed));
+};
+
+// probeResultHasUsableRateLimit decides whether a setup-token probe response
+// carries enough rate-limit data to render (true) or should be treated as a
+// genuine failure (false). A 429 quota-exhausted probe still returns reset +
+// status headers, so we must render those rather than throw. Exported for
+// unit testing.
+export const probeResultHasUsableRateLimit = (
+  windows: ClaudeQuotaWindow[],
+  overallStatus: string | null,
+  representativeClaim: string | null,
+  overallResetLabel: string
+): boolean =>
+  windows.length > 0 ||
+  Boolean(overallStatus) ||
+  Boolean(representativeClaim) ||
+  overallResetLabel !== '-';
+
+export const buildClaudeRateLimitProbeWindows = (
   headers: Record<string, string[]>,
   t: TFunction
 ): ClaudeQuotaWindow[] => {
@@ -1140,11 +1165,12 @@ const fetchClaudeQuota = async (
       normalizeApiCallHeaderValue(result.header, 'anthropic-ratelimit-unified-representative-claim')
     );
 
-    const hasRateLimitData =
-      windows.length > 0 ||
-      Boolean(overallStatus) ||
-      Boolean(representativeClaim) ||
-      overallResetLabel !== '-';
+    const hasRateLimitData = probeResultHasUsableRateLimit(
+      windows,
+      overallStatus,
+      representativeClaim,
+      overallResetLabel
+    );
 
     if (!hasRateLimitData) {
       if (result.statusCode < 200 || result.statusCode >= 300) {
@@ -1318,9 +1344,7 @@ const renderClaudeItems = (
       // Show REMAINING percentage to stay consistent with the Codex and
       // Gemini cards (the Anthropic header reports utilization/used, so we
       // invert it). High remaining = green via the shared thresholds.
-      const used = window.usedPercent;
-      const clampedUsed = used === null ? null : Math.max(0, Math.min(100, used));
-      const remaining = clampedUsed === null ? null : Math.max(0, Math.min(100, 100 - clampedUsed));
+      const remaining = claudeRemainingPercent(window.usedPercent);
       const percentLabel = remaining === null ? '--' : `${Math.round(remaining)}%`;
       const statusLabel = resolveStatusLabel(window.status);
       const windowLabel = window.labelKey ? t(window.labelKey) : window.label;
