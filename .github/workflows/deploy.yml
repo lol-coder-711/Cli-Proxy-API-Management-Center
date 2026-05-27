@@ -13,7 +13,7 @@ name: Deploy
 on:
   push:
     branches:
-      - v1.12.0-with-usage-page
+      - main
   workflow_dispatch: {}
 
 concurrency:
