@@ -1122,10 +1122,13 @@ const fetchClaudeQuota = async (
       data: CLAUDE_CODE_QUOTA_PROBE_BODY,
     });
 
-    if (result.statusCode < 200 || result.statusCode >= 300) {
-      throw createStatusError(getApiCallErrorMessage(result), result.statusCode);
-    }
-
+    // Anthropic returns the anthropic-ratelimit-unified-* headers on BOTH a
+    // successful (200) probe AND a rate-limited (429) one. When an account's
+    // quota is exhausted the probe is rejected with 429, but the response still
+    // carries the reset timestamp and status=rejected. Parse the headers first
+    // so an exhausted account renders its windows + reset time instead of a
+    // generic "unavailable" error. Only fall back to throwing when the response
+    // carries no usable rate-limit data at all (genuine auth/server failure).
     const windows = buildClaudeRateLimitProbeWindows(result.header, t);
     const overallStatus = normalizeClaudeRateLimitStatus(
       normalizeApiCallHeaderValue(result.header, 'anthropic-ratelimit-unified-status')
@@ -1137,12 +1140,16 @@ const fetchClaudeQuota = async (
       normalizeApiCallHeaderValue(result.header, 'anthropic-ratelimit-unified-representative-claim')
     );
 
-    if (
-      windows.length === 0 &&
-      !overallStatus &&
-      !representativeClaim &&
-      overallResetLabel === '-'
-    ) {
+    const hasRateLimitData =
+      windows.length > 0 ||
+      Boolean(overallStatus) ||
+      Boolean(representativeClaim) ||
+      overallResetLabel !== '-';
+
+    if (!hasRateLimitData) {
+      if (result.statusCode < 200 || result.statusCode >= 300) {
+        throw createStatusError(getApiCallErrorMessage(result), result.statusCode);
+      }
       throw new Error(t('claude_quota.empty_windows'));
     }
 
@@ -1227,17 +1234,6 @@ const renderClaudeItems = (
   const representativeClaim = quota.representativeClaim ?? null;
   const nodes: ReactNode[] = [];
 
-  const formatUtilizationLabel = (value: number | null): string => {
-    if (value === null) return '--';
-    const clamped = Math.max(0, Math.min(100, value));
-    const rounded = Number.isInteger(clamped)
-      ? clamped.toFixed(0)
-      : clamped >= 10
-        ? clamped.toFixed(0)
-        : clamped.toFixed(1);
-    return t('claude_quota.utilization_value', { value: rounded });
-  };
-
   const resolveStatusLabel = (status: string | null | undefined): string | null => {
     const normalized = normalizeClaudeRateLimitStatus(status);
     if (!normalized) return null;
@@ -1319,9 +1315,13 @@ const renderClaudeItems = (
 
   nodes.push(
     ...windows.map((window) => {
+      // Show REMAINING percentage to stay consistent with the Codex and
+      // Gemini cards (the Anthropic header reports utilization/used, so we
+      // invert it). High remaining = green via the shared thresholds.
       const used = window.usedPercent;
       const clampedUsed = used === null ? null : Math.max(0, Math.min(100, used));
-      const percentLabel = formatUtilizationLabel(clampedUsed);
+      const remaining = clampedUsed === null ? null : Math.max(0, Math.min(100, 100 - clampedUsed));
+      const percentLabel = remaining === null ? '--' : `${Math.round(remaining)}%`;
       const statusLabel = resolveStatusLabel(window.status);
       const windowLabel = window.labelKey ? t(window.labelKey) : window.label;
 
@@ -1340,7 +1340,11 @@ const renderClaudeItems = (
             h('span', { className: styleMap.quotaReset }, window.resetLabel)
           )
         ),
-        h(QuotaProgressBar, { percent: clampedUsed, highThreshold: 80, mediumThreshold: 50 })
+        h(QuotaProgressBar, {
+          percent: remaining,
+          highThreshold: QUOTA_PROGRESS_HIGH_THRESHOLD,
+          mediumThreshold: QUOTA_PROGRESS_MEDIUM_THRESHOLD,
+        })
       );
     })
   );
