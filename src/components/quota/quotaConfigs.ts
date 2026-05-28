@@ -998,13 +998,16 @@ const normalizeClaudeRepresentativeClaim = (value: unknown): string | null => {
   return lowered;
 };
 
-const normalizeClaudeUtilizationPercent = (value: unknown): number | null => {
+// Anthropic's rate-limit "utilization" is ALWAYS a fraction where 1.0 == 100%
+// used. On an exhausted window it exceeds 1.0 (e.g. 1.17 == 117% used / 17%
+// overage). The previous `<= 1 ? *100 : asis` heuristic mis-read any fraction
+// above 1.0 as an already-percent value (1.17 -> "1.17%"), which made a fully
+// exhausted account render as ~99% remaining. Always scale the fraction to a
+// percent; callers clamp the final remaining value to [0,100].
+export const normalizeClaudeUtilizationPercent = (value: unknown): number | null => {
   const normalized = normalizeNumberValue(value);
   if (normalized === null) return null;
-  if (normalized >= 0 && normalized <= 1) {
-    return normalized * 100;
-  }
-  return normalized;
+  return normalized * 100;
 };
 
 // claudeRemainingPercent inverts the Anthropic "utilization" (used %) into the

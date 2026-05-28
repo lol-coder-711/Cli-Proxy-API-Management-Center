@@ -3,12 +3,63 @@ import {
   claudeRemainingPercent,
   probeResultHasUsableRateLimit,
   buildClaudeRateLimitProbeWindows,
+  normalizeClaudeUtilizationPercent,
 } from './quotaConfigs';
 import type { ClaudeQuotaWindow } from '@/types/quota';
 
 // Stub i18n: return the key so we can assert on labelKey wiring without a
 // real translation table.
 const t = ((key: string) => key) as never;
+
+describe('normalizeClaudeUtilizationPercent (Fix 3: overage fraction >1.0)', () => {
+  test('null stays null', () => {
+    expect(normalizeClaudeUtilizationPercent(undefined)).toBeNull();
+    expect(normalizeClaudeUtilizationPercent(null)).toBeNull();
+  });
+
+  test('0.26 fraction => 26% used', () => {
+    expect(normalizeClaudeUtilizationPercent('0.26')).toBe(26);
+  });
+
+  test('1.0 fraction => 100% used', () => {
+    expect(normalizeClaudeUtilizationPercent('1')).toBe(100);
+  });
+
+  test('REGRESSION: 1.17 overage fraction => 117% used, NOT 1.17%', () => {
+    // This is the exact header an exhausted 5h window returns
+    // (anthropic-ratelimit-unified-5h-utilization: 1.17). The old
+    // <=1 heuristic returned 1.17, making the card show ~99% remaining.
+    expect(normalizeClaudeUtilizationPercent('1.17')).toBe(117);
+  });
+
+  test('exhausted window (1.17 used) => 0% remaining after clamp', () => {
+    const used = normalizeClaudeUtilizationPercent('1.17');
+    expect(claudeRemainingPercent(used)).toBe(0); // clamped, not 99
+  });
+});
+
+describe('end-to-end: real exhausted-account probe headers', () => {
+  test('susanna 5h exhausted (utilization 1.17, rejected) => 0% remaining', () => {
+    const headers: Record<string, string[]> = {
+      'anthropic-ratelimit-unified-5h-status': ['rejected'],
+      'anthropic-ratelimit-unified-5h-utilization': ['1.17'],
+      'anthropic-ratelimit-unified-5h-reset': ['1780005600'],
+      'anthropic-ratelimit-unified-7d-status': ['allowed'],
+      'anthropic-ratelimit-unified-7d-utilization': ['0.15'],
+      'anthropic-ratelimit-unified-7d-reset': ['1780498800'],
+    };
+    const windows = buildClaudeRateLimitProbeWindows(headers, t);
+    const byId = Object.fromEntries(windows.map((w) => [w.id, w]));
+
+    // 5h: 117% used -> 0% remaining (was the 99% bug)
+    expect(byId['five-hour'].status).toBe('rejected');
+    expect(claudeRemainingPercent(byId['five-hour'].usedPercent)).toBe(0);
+
+    // 7d: 15% used -> 85% remaining
+    expect(byId['seven-day'].status).toBe('allowed');
+    expect(claudeRemainingPercent(byId['seven-day'].usedPercent)).toBe(85);
+  });
+});
 
 describe('claudeRemainingPercent (Fix 2: show remaining, not used)', () => {
   test('null utilization stays null (renders as --)', () => {
@@ -81,9 +132,11 @@ describe('buildClaudeRateLimitProbeWindows (header parsing)', () => {
     expect(claudeRemainingPercent(w.usedPercent)).toBe(0);
   });
 
-  test('utilization given as a 0-100 percent passes through (not re-scaled)', () => {
+  test('utilization fraction 0.42 => 42% used / 58% remaining', () => {
+    // Anthropic always sends utilization as a fraction (0.42), never as a
+    // 0-100 percent. The window must scale it to 42%.
     const headers: Record<string, string[]> = {
-      'anthropic-ratelimit-unified-7d-utilization': ['42'],
+      'anthropic-ratelimit-unified-7d-utilization': ['0.42'],
     };
     const windows = buildClaudeRateLimitProbeWindows(headers, t);
     expect(windows.length).toBe(1);
