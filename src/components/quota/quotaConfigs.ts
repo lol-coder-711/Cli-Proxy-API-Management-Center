@@ -983,12 +983,12 @@ const normalizeApiCallHeaderValue = (
   return null;
 };
 
-const normalizeClaudeRateLimitStatus = (value: unknown): string | null => {
+export const normalizeClaudeRateLimitStatus = (value: unknown): string | null => {
   const normalized = normalizeStringValue(value);
   return normalized ? normalized.toLowerCase() : null;
 };
 
-const normalizeClaudeRepresentativeClaim = (value: unknown): string | null => {
+export const normalizeClaudeRepresentativeClaim = (value: unknown): string | null => {
   const normalized = normalizeStringValue(value);
   if (!normalized) return null;
 
@@ -1070,7 +1070,7 @@ export const buildClaudeRateLimitProbeWindows = (
   return windows;
 };
 
-const normalizeFlagValue = (value: unknown): boolean | undefined => {
+export const normalizeFlagValue = (value: unknown): boolean | undefined => {
   if (value === undefined || value === null) return undefined;
   if (typeof value === 'boolean') return value;
   if (typeof value === 'number') return value !== 0;
@@ -1099,7 +1099,7 @@ const parseClaudeProfilePayload = (payload: unknown): ClaudeProfileResponse | nu
   return null;
 };
 
-const resolveClaudePlanType = (profile: ClaudeProfileResponse | null): string | null => {
+export const resolveClaudePlanType = (profile: ClaudeProfileResponse | null): string | null => {
   if (!profile) return null;
 
   const hasClaudeMax = normalizeFlagValue(profile.account?.has_claude_max);
